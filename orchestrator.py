@@ -30,7 +30,7 @@ def execute_encoder_code(url):
             time.sleep(1)  # Check status every second
 
         execution_result["output"] = "".join(output).strip()  # Convert list to string and remove extra spaces
-        print(f"Execution Output: {result}")
+        print(f"Execution Output: {execution_result['output']}")
 
         # TODO: Call the AI microservice with the results above as input 
         # and return the result of the AI microservice 
