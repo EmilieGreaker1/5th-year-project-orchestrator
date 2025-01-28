@@ -1,8 +1,10 @@
 from fastapi import FastAPI
 import threading
-import time
+import requests
 import paramiko  # For executing code on a remote VM via SSH
-# import psycopg2  # Replace with your database client library
+import re
+import json
+from urllib.parse import urlparse
 
 app = FastAPI()
 
@@ -19,73 +21,112 @@ def execute_encoder_code(url):
 
     try:
         ssh.connect(hostname="192.168.37.88", username="user", password="user")
-        command = f"python3 /home/user/ExtractParamsURL/threadManager.py '{url}'"
+        command = f"python3 /home/user/ExtractParamsURL/threadsManager.py '{url}'"
         stdin, stdout, stderr = ssh.exec_command(command)
         
-        output = []
-        while not stop_event.is_set():
-            if stdout.channel.exit_status_ready():  # Check if the process is done
-                output.extend(stdout.readlines())
-                break
-            time.sleep(1)  # Check status every second
+        # Continuously check if we should stop
+        while not stdout.channel.exit_status_ready():
+            if stop_event.is_set():
+                print("Stopping encoder execution early...")
+                return
 
-        execution_result["output"] = "".join(output).strip()  # Convert list to string and remove extra spaces
-        print(f"Execution Output: {execution_result['output']}")
+        raw_output = stdout.read().decode().strip()
 
-        # TODO: Call the AI microservice with the results above as input 
-        # and return the result of the AI microservice 
-            
+        # Check stop event before processing further
+        if stop_event.is_set():
+            print("Encoder execution stopped before processing JSON.")
+            return
+
+        match = re.search(r"(\{.*\})", raw_output, re.DOTALL)
+        if match:
+            json_str = match.group(1)  # Extract only the JSON part
+        else:
+            json_str = None
+
+        if json_str:
+            try:
+                encoder_output = json.loads(json_str)
+            except json.JSONDecodeError as e:
+                execution_result["output"] = {
+                    "error": "Invalid JSON format",
+                    "raw_output": raw_output
+                }
+                return
+        else:
+            execution_result["output"] = {
+                "error": "No valid JSON found",
+                "raw_output": raw_output
+            }
+            return
+
+        json_data = json.dumps(encoder_output)
+        url_predict = "http://192.168.37.14:8004/predict"
+        headers = {"Content-Type": "application/json"}
+
+        response = requests.post(url_predict, data=json_data, headers=headers, timeout=10)
+        print("response: ", response.json())
+
+        # Check stop event before saving result
+        if stop_event.is_set():
+            print("Encoder execution stopped before saving output.")
+            return
+
+        execution_result['output'] = response.json()
+        print("Command Output:", execution_result['output'])
+
+        # Add prediction to database table
+        url_add_to_db = f"http://192.168.37.38:8010/reliability/add"
+        headers = {"Content-Type": "application/json"}
+        json_data = {"url": url, "prediction": execution_result['output'].get("prediction", None), "confidence": execution_result['output'].get("confidence", None)}
+        response = requests.post(url_add_to_db, json=json_data, headers=headers, timeout=10)
+        print("Add to database response: ", response.json())
+
     finally:
         ssh.close()
         print("Execution thread stopped.")
-        return result
 
-def query_database():
+def query_database(input_url):
     """Function to query the database."""
     global stop_event
-    conn = None
+    url = f"http://192.168.37.38:8010/reliability/check/?url={input_url}"
+
     try:
-        conn = psycopg2.connect(
-            dbname="your_db",
-            user="your_user",
-            password="your_password",
-            host="db-vm-ip",
-            port="5432"
-        )
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM your_table WHERE condition=True;")
-        result = cursor.fetchall()
+        response = requests.get(url, timeout=10)
+        
+        execution_result["output"] = response.json()
+        print("Database Query Output:", execution_result["output"])
 
-        print(f"Database result: {result}")
-        stop_event.set()  # Signal the execution thread to stop if DB query finishes first
+    except requests.RequestException as e:
+        print(f"Database request failed: {e}")
 
-    except Exception as e:
-        print(f"Database error: {e}")
-    
-    finally:
-        if conn:
-            conn.close()
-
-@app.post("/start_orchestration/")
+@app.get("/start_orchestration/")
 def start_orchestration(url):
     global stop_event, execution_result
     stop_event.clear()  # Reset stop flag
-    execution_result["output"] = None
+    execution_result = {"output": None}
 
     # Create threads
     exec_thread = threading.Thread(target=execute_encoder_code, args=(url,))
-    # db_thread = threading.Thread(target=query_database)
+    db_thread = threading.Thread(target=query_database, args=(url,))
 
     exec_thread.start()
-    # db_thread.start()
+    db_thread.start()
 
-    # db_thread.join()  # Wait for the DB thread to complete
+    db_thread.join()  # Wait for the DB thread to complete
 
-    #if exec_thread.is_alive():
-    #    print("Database finished first. Stopping execution thread...")
-    #    stop_event.set()  # Request execution thread to stop
+    # If the database query was successful, return immediately
+    print(execution_result["output"].get("prediction", None))
+    if execution_result["output"].get('prediction', None) != "not_found":
+        # If DB query finishes first, stop the encoder immediately
+        stop_event.set()
+        print("Database finished first. Stopping encoder...")
+
+        return {"status": "Orchestration complete", "execution_output": execution_result["output"]}
+
+    print("Database result was not found or an error occurred. Awaiting encoder result...")
     
-    exec_thread.join()  # Ensure execution thread stops before returning
+    # If database failed, wait for the encoder thread to complete
+    exec_thread.join()
 
     return {"status": "Orchestration complete", "execution_output": execution_result["output"]}
 
